@@ -4,10 +4,13 @@
   "tab_width": 4,
   "auto_indent": true,
   "encoding": "utf-8",
-  "window_width": 640,
-  "window_height": 480,
+  "window_width": 859,
+  "window_height": 523,
   "recent_files": [
-    "/var/folders/3w/txr6v8wx3b510q_x5hlfnkl80000gn/T/tmp0ayg5898.txt"
+    "/Users/gagehansen/textedit-u1244391-5/large.txt",
+    "/Users/gagehansen/textedit-u1244391-5/medium.txt",
+    "/Users/gagehansen/textedit-u1244391-5/small.txt",
+    "/var/folders/3w/txr6v8wx3b510q_x5hlfnkl80000gn/T/tmp2a18lldl.txt"
   ],
-  "dark_mode": false
+  "dark_mode": true
 }

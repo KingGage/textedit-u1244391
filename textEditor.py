@@ -1,6 +1,7 @@
 import sys
 import json
 import re
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from enum import Enum
@@ -14,7 +15,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QDir, QFileSystemWatcher, QModelIndex
 from PyQt6.QtGui import QFileSystemModel
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRect, QSize
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRect, QSize, QEvent
 from PyQt6.QtGui import QKeySequence, QAction, QFont, QUndoStack, QColor, QPainter, QTextFormat, QTextCursor
 
 
@@ -65,6 +66,75 @@ class SettingsManager:
     def set(self, key: str, value: Any):
         """Set a setting value."""
         self.settings[key] = value
+
+
+# ============================================================================
+# Frame Timing
+# ============================================================================
+
+class FrameTimer:
+    """Tracks frame timing metrics (last, average, max frame times)."""
+    
+    def __init__(self):
+        self.enabled = False
+        self.frame_start_time = None
+        self.user_input_triggered = False
+        
+        # Timing data
+        self.last_frame_time = 0.0  # ms
+        self.frame_times = []  # list of frame times in ms
+        self.max_frame_time = 0.0  # ms
+    
+    def start_frame(self) -> None:
+        """Mark the start of a frame (only if user input was triggered)."""
+        if not self.enabled or not self.user_input_triggered:
+            return
+        self.frame_start_time = time.time()
+    
+    def end_frame(self) -> None:
+        """Mark the end of a frame and record timing."""
+        if not self.enabled or self.frame_start_time is None:
+            self.user_input_triggered = False
+            return
+        
+        elapsed = (time.time() - self.frame_start_time) * 1000  # Convert to ms
+        self.last_frame_time = elapsed
+        self.frame_times.append(elapsed)
+        
+        if elapsed > self.max_frame_time:
+            self.max_frame_time = elapsed
+        
+        self.user_input_triggered = False
+        self.frame_start_time = None
+    
+    def set_user_input_triggered(self) -> None:
+        """Set flag indicating user input triggered this frame."""
+        if self.enabled:
+            self.user_input_triggered = True
+    
+    def get_average_frame_time(self) -> float:
+        """Get average frame time in ms."""
+        if not self.frame_times:
+            return 0.0
+        return sum(self.frame_times) / len(self.frame_times)
+    
+    def reset(self) -> None:
+        """Reset all timing data."""
+        self.frame_times = []
+        self.last_frame_time = 0.0
+        self.max_frame_time = 0.0
+        self.user_input_triggered = False
+        self.frame_start_time = None
+    
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable frame timing."""
+        if not enabled:
+            # When disabling, clear all data
+            self.reset()
+        else:
+            # When enabling (transitioning from disabled to enabled), reset data
+            self.reset()
+        self.enabled = enabled
 
 
 # ============================================================================
@@ -849,6 +919,13 @@ class TextEditor(QPlainTextEdit):
         self.multi_cursor_manager = MultiCursorManager(self)
         self.rect_selection_manager = RectangularSelectionManager(self)
         
+        # Frame timing
+        self.frame_timer: Optional[FrameTimer] = None
+        
+        # Connect scrollbar signals for frame timing
+        self.verticalScrollBar().actionTriggered.connect(self._on_scrollbar_action)
+        self.horizontalScrollBar().actionTriggered.connect(self._on_scrollbar_action)
+        
         # Connect signals for line number updates
         self.blockCountChanged.connect(self.update_line_number_area_width)
         self.updateRequest.connect(self.update_line_number_area)
@@ -991,6 +1068,11 @@ class TextEditor(QPlainTextEdit):
     
     def keyPressEvent(self, event):
         """Handle custom key press events."""
+        # Mark frame as triggered by user input
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+        
         cursor = self.textCursor()
         key = event.key()
         text = event.text()
@@ -1002,18 +1084,24 @@ class TextEditor(QPlainTextEdit):
                 self.multi_cursor_manager.clear()
                 self.rect_selection_manager.clear()
                 self.highlight_current_line()
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
         
         # Handle Ctrl+Alt+Up - add cursor above
         if key == Qt.Key.Key_Up and modifiers == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
             self.multi_cursor_manager.add_cursor_above()
             self.highlight_current_line()
+            if self.frame_timer:
+                self.frame_timer.end_frame()
             return
         
         # Handle Ctrl+Alt+Down - add cursor below
         if key == Qt.Key.Key_Down and modifiers == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
             self.multi_cursor_manager.add_cursor_below()
             self.highlight_current_line()
+            if self.frame_timer:
+                self.frame_timer.end_frame()
             return
         
         # Convert rectangular selection to cursors when user starts typing
@@ -1030,12 +1118,16 @@ class TextEditor(QPlainTextEdit):
                 self._multi_cursor_delete(backwards=True)
                 super().keyPressEvent(event)
                 self.highlight_current_line()
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             if key == Qt.Key.Key_Delete:
                 self._multi_cursor_delete(backwards=False)
                 super().keyPressEvent(event)
                 self.highlight_current_line()
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             if text and len(text) == 1:
@@ -1043,6 +1135,8 @@ class TextEditor(QPlainTextEdit):
                 self._multi_cursor_insert(text)
                 super().keyPressEvent(event)
                 self.highlight_current_line()
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
         
         # Handle Tab
@@ -1052,6 +1146,8 @@ class TextEditor(QPlainTextEdit):
                 self.highlight_current_line()
             else:
                 self.insertPlainText(" " * self.tab_width)
+            if self.frame_timer:
+                self.frame_timer.end_frame()
             return
         
         # Handle Enter/Return with auto-indent
@@ -1063,6 +1159,8 @@ class TextEditor(QPlainTextEdit):
                 self._handle_auto_indent()
             else:
                 super().keyPressEvent(event)
+            if self.frame_timer:
+                self.frame_timer.end_frame()
             return
         
         # Handle Backspace - delete pairs and smart indent
@@ -1070,10 +1168,14 @@ class TextEditor(QPlainTextEdit):
             if self.bracket_manager.should_delete_pair(cursor):
                 cursor.deleteChar()  # Delete the closing bracket
                 super().keyPressEvent(event)  # Delete the opening bracket
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             if self.quote_manager.should_delete_pair(cursor):
                 cursor.deleteChar()  # Delete the closing quote
                 super().keyPressEvent(event)  # Delete the opening quote
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             # Smart backspace: delete tab_width spaces at a time on indented lines
@@ -1092,9 +1194,13 @@ class TextEditor(QPlainTextEdit):
                     
                     for _ in range(spaces_to_delete):
                         cursor.deletePreviousChar()
+                    if self.frame_timer:
+                        self.frame_timer.end_frame()
                     return
             
             super().keyPressEvent(event)
+            if self.frame_timer:
+                self.frame_timer.end_frame()
             return
         
         # Handle character input
@@ -1104,18 +1210,24 @@ class TextEditor(QPlainTextEdit):
             # Handle quotes with selection wrapping
             if self.quote_manager.is_quote(char) and cursor.hasSelection():
                 self.quote_manager.wrap_selection(cursor, char)
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             # Skip over closing brackets
             if self.bracket_manager.should_skip_closing(char, cursor):
                 cursor.movePosition(cursor.MoveOperation.Right)
                 self.setTextCursor(cursor)
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             # Skip over closing quotes
             if self.quote_manager.should_skip_closing(char, cursor):
                 cursor.movePosition(cursor.MoveOperation.Right)
                 self.setTextCursor(cursor)
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             # Auto-close brackets
@@ -1124,6 +1236,8 @@ class TextEditor(QPlainTextEdit):
                 cursor.insertText(char + closing)
                 cursor.movePosition(cursor.MoveOperation.Left)
                 self.setTextCursor(cursor)
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             # Auto-close quotes
@@ -1131,6 +1245,8 @@ class TextEditor(QPlainTextEdit):
                 cursor.insertText(char + char)
                 cursor.movePosition(cursor.MoveOperation.Left)
                 self.setTextCursor(cursor)
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
             
             # Handle auto-dedent for closing brackets (without auto-close)
@@ -1139,9 +1255,15 @@ class TextEditor(QPlainTextEdit):
                 cursor.select(cursor.SelectionType.LineUnderCursor)
                 line_text = cursor.selectedText()
                 cursor.insertText(' ' * new_indent + char)
+                if self.frame_timer:
+                    self.frame_timer.end_frame()
                 return
         
         super().keyPressEvent(event)
+        
+        # End frame timing after key processing
+        if self.frame_timer:
+            self.frame_timer.end_frame()
     
     def _handle_auto_indent(self):
         """Handle auto-indentation on new line."""
@@ -1184,6 +1306,11 @@ class TextEditor(QPlainTextEdit):
     
     def mousePressEvent(self, event):
         """Handle mouse press for multi-cursor and rectangular selection."""
+        # Mark frame as triggered by user input
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+        
         modifiers = event.modifiers()
         
         # Alt+Shift+Click: Start rectangular selection (check first, before Alt+Click)
@@ -1196,6 +1323,8 @@ class TextEditor(QPlainTextEdit):
             column = cursor.positionInBlock()
             self.rect_selection_manager.start_selection(line, column)
             self.highlight_current_line()
+            if self.frame_timer:
+                self.frame_timer.end_frame()
             return
         
         # Alt+Click: Add cursor at click position (only if not doing rect selection)
@@ -1203,6 +1332,8 @@ class TextEditor(QPlainTextEdit):
             cursor = self.cursorForPosition(event.pos())
             self.multi_cursor_manager.add_cursor(cursor)
             self.highlight_current_line()
+            if self.frame_timer:
+                self.frame_timer.end_frame()
             return
         
         # Clear multi-cursor on regular click (without modifiers)
@@ -1215,6 +1346,10 @@ class TextEditor(QPlainTextEdit):
                 self.highlight_current_line()
         
         super().mousePressEvent(event)
+        
+        # End frame timing after mouse press processing
+        if self.frame_timer:
+            self.frame_timer.end_frame()
     
     def mouseMoveEvent(self, event):
         """Handle mouse move for rectangular selection."""
@@ -1234,6 +1369,31 @@ class TextEditor(QPlainTextEdit):
         # Keep rectangular selection active - don't convert to cursors yet
         # Conversion happens when user starts typing
         super().mouseReleaseEvent(event)
+    
+    def wheelEvent(self, event):
+        """Handle wheel/scroll events."""
+        # Mark frame as triggered by user input
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+        
+        super().wheelEvent(event)
+        
+        # End frame timing after wheel processing
+        if self.frame_timer:
+            self.frame_timer.end_frame()
+    
+    def _on_scrollbar_action(self, action):
+        """Handle scrollbar interactions (thumb drag, track click, arrow click)."""
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+            QTimer.singleShot(0, self._end_scrollbar_frame)
+    
+    def _end_scrollbar_frame(self):
+        """End frame timing after scrollbar-triggered repaint completes."""
+        if self.frame_timer:
+            self.frame_timer.end_frame()
     
     def _get_cursor_line_column(self, cursor) -> tuple[int, int]:
         """Get line and column for a cursor."""
@@ -2232,6 +2392,64 @@ class FileTreeExplorer(QDockWidget):
             """)
 
 
+class FrameTimerWidget(QWidget):
+    """Widget that displays frame timing statistics."""
+    
+    def __init__(self, frame_timer: FrameTimer, dark_mode: bool = False, parent=None):
+        super().__init__(parent)
+        self.frame_timer = frame_timer
+        self.dark_mode = dark_mode
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 5, 10, 5)
+        layout.setSpacing(15)
+        
+        # Labels for frame timing data
+        self.last_label = QLabel("Last: 0.00 ms")
+        self.avg_label = QLabel("Avg: 0.00 ms")
+        self.max_label = QLabel("Max: 0.00 ms")
+        
+        for label in [self.last_label, self.avg_label, self.max_label]:
+            label.setMinimumWidth(100)
+            layout.addWidget(label)
+        
+        layout.addStretch()
+        self.setLayout(layout)
+        
+        # Timer to update display
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self._update_display)
+        self.update_timer.start(100)  # Update every 100ms
+        
+        self.apply_theme(dark_mode)
+    
+    def _update_display(self):
+        """Update the display with current timing values."""
+        self.last_label.setText(f"Last: {self.frame_timer.last_frame_time:.2f} ms")
+        avg = self.frame_timer.get_average_frame_time()
+        self.avg_label.setText(f"Avg: {avg:.2f} ms")
+        self.max_label.setText(f"Max: {self.frame_timer.max_frame_time:.2f} ms")
+    
+    def apply_theme(self, dark_mode: bool):
+        """Apply dark or light theme."""
+        self.dark_mode = dark_mode
+        if dark_mode:
+            self.setStyleSheet("""
+                QWidget { background-color: #2d2d2d; color: #d4d4d4; }
+                QLabel { color: #d4d4d4; }
+            """)
+        else:
+            self.setStyleSheet("""
+                QWidget { background-color: #f0f0f0; color: #000000; }
+                QLabel { color: #000000; }
+            """)
+    
+    def closeEvent(self, event):
+        """Stop the update timer when widget is closed."""
+        self.update_timer.stop()
+        super().closeEvent(event)
+
+
 class StatusBarManager:
     """Updates status bar with line/column position, encoding, and modified status."""
     
@@ -2432,10 +2650,15 @@ class FindReplaceDialog(QDialog):
     
     def find_all(self):
         """Find all occurrences across all open files and highlight them."""
+        frame_timer = self.main_window.frame_timer
+        frame_timer.set_user_input_triggered()
+        frame_timer.start_frame()
+        
         pattern = self.find_input.text()
         if not pattern:
             self._clear_all_highlights()
             self.setWindowTitle("Find & Replace (All Files)")
+            frame_timer.end_frame()
             return
         
         case_sensitive = self.case_sensitive.isChecked()
@@ -2473,13 +2696,19 @@ class FindReplaceDialog(QDialog):
             pass
         
         self.setWindowTitle(f"Find & Replace - {total_matches} match(es) in {files_with_matches} file(s)")
+        frame_timer.end_frame()
     
     def replace_all(self):
         """Replace all occurrences across all open files."""
+        frame_timer = self.main_window.frame_timer
+        frame_timer.set_user_input_triggered()
+        frame_timer.start_frame()
+        
         pattern = self.find_input.text()
         replacement = self.replace_input.text()
         
         if not pattern:
+            frame_timer.end_frame()
             return
         
         # Warn if replacement text is empty
@@ -2490,6 +2719,7 @@ class FindReplaceDialog(QDialog):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.No:
+                frame_timer.end_frame()
                 return
         
         case_sensitive = self.case_sensitive.isChecked()
@@ -2525,6 +2755,7 @@ class FindReplaceDialog(QDialog):
         # Clear highlights and show result
         self._clear_all_highlights()
         self.setWindowTitle(f"Find & Replace - Replaced {total_count} in {files_modified} file(s)")
+        frame_timer.end_frame()
 
 
 class SearchEngine:
@@ -2596,6 +2827,11 @@ class MainWindow(QMainWindow):
         self.file_manager = FileManager()
         self.dark_mode = False
         
+        # Create frame timer
+        self.frame_timer = FrameTimer()
+        self.frame_timer_widget: Optional[FrameTimerWidget] = None
+        self.frame_timer_visible = False
+        
         # Create editor pane (with tabs and split support)
         self.editor_pane = EditorPane(self.settings_manager)
         
@@ -2615,6 +2851,12 @@ class MainWindow(QMainWindow):
         central_layout.setSpacing(0)
         central_layout.addWidget(self.menu_tab_bar)
         central_layout.addWidget(self.editor_pane)
+        
+        # Add frame timer widget (initially hidden)
+        self.frame_timer_widget = FrameTimerWidget(self.frame_timer, self.dark_mode)
+        self.frame_timer_widget.setVisible(False)
+        central_layout.addWidget(self.frame_timer_widget)
+        
         self.setCentralWidget(central_widget)
         
         # Status bar (will update based on current editor)
@@ -2627,6 +2869,9 @@ class MainWindow(QMainWindow):
         # Connect to tab changes to update status bar
         for tw in self.editor_pane.tab_widgets:
             tw.tab_changed.connect(self._on_tab_changed)
+        
+        # Connect frame timer hook to all editors
+        self._connect_frame_timer_to_editors()
         
         # Connect menu actions
         self._connect_actions()
@@ -2648,6 +2893,9 @@ class MainWindow(QMainWindow):
         """Update UI when tab changes."""
         self._update_title()
         self._connect_current_editor()
+        # Connect frame timer to the new current editor
+        if tab.editor:
+            tab.editor.frame_timer = self.frame_timer
     
     def _connect_current_editor(self):
         """Connect signals from current editor."""
@@ -2668,6 +2916,25 @@ class MainWindow(QMainWindow):
             line = cursor.blockNumber() + 1
             column = cursor.positionInBlock() + 1
             self.position_label.setText(f"Line {line}, Column {column}")
+    
+    def _connect_frame_timer_to_editors(self):
+        """Connect frame timer to all editors."""
+        for tw in self.editor_pane.tab_widgets:
+            for tab in tw.tabs:
+                tab.editor.frame_timer = self.frame_timer
+    
+    def _toggle_frame_timer(self):
+        """Toggle frame timer visibility and recording (Ctrl+P)."""
+        if self.frame_timer_visible:
+            # Hide timer and disable recording
+            self.frame_timer_visible = False
+            self.frame_timer.set_enabled(False)
+            self.frame_timer_widget.setVisible(False)
+        else:
+            # Show timer and enable recording
+            self.frame_timer_visible = True
+            self.frame_timer.set_enabled(True)
+            self.frame_timer_widget.setVisible(True)
     
     def _connect_actions(self):
         """Connect menu actions to functions."""
@@ -2753,6 +3020,8 @@ class MainWindow(QMainWindow):
         self.dark_mode = dark_mode
         self.menu_tab_bar.apply_theme(dark_mode)
         self.file_explorer.apply_theme(dark_mode)
+        if self.frame_timer_widget:
+            self.frame_timer_widget.apply_theme(dark_mode)
         if dark_mode:
             self.setStyleSheet("""
                 QMainWindow { background-color: #2d2d2d; }
@@ -2789,6 +3058,9 @@ class MainWindow(QMainWindow):
     
     def _open_file_path(self, file_path: str):
         """Open a file by path in a new tab."""
+        self.frame_timer.set_user_input_triggered()
+        self.frame_timer.start_frame()
+        
         content, success = self.file_manager.read_file(Path(file_path))
         
         if success:
@@ -2805,6 +3077,8 @@ class MainWindow(QMainWindow):
             self.file_explorer.highlight_file(file_path)
         else:
             QMessageBox.critical(self, "Error", content)
+        
+        self.frame_timer.end_frame()
     
     def _open_file_from_explorer(self, file_path: str):
         """Open a file from the file explorer."""
@@ -2838,6 +3112,15 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowTitle("Text Editor")
     
+    def keyPressEvent(self, event):
+        """Handle global keyboard shortcuts."""
+        # Ctrl+P: Toggle frame timer
+        if event.key() == Qt.Key.Key_P and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self._toggle_frame_timer()
+            return
+        
+        super().keyPressEvent(event)
+    
     def closeEvent(self, event):
         """Handle window close."""
         # Check all tabs for unsaved changes
@@ -2869,6 +3152,13 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    
+    # Open file passed as command-line argument
+    if len(sys.argv) > 1:
+        file_path = sys.argv[1]
+        if Path(file_path).is_file():
+            window._open_file_path(file_path)
+    
     sys.exit(app.exec())
 
 

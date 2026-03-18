@@ -93,3 +93,134 @@ Version 3.0.0 (Week 3)
     - tab spacing is saved when you press enter. 
     - backspace by tabs on new lines. 
     These didnt take too long to implement but the bracket and spacing took a couple tries to get correct. When pressing enter between brackets the bracket would go down one but then tab to the right which looked off because its different from other editors. after a brief description of how it should work it was able to fix it easy. The highlighted matching brackets would sometimes just stop working between prompts somehow but got that all fixed after reminding the AI.
+
+
+# Frame Timer Documentation
+
+## Overview
+
+The Frame Timer is a performance monitoring widget that tracks the time taken to process individual frames in the text editor. It measures user-triggered rendering performance by monitoring the time between when a user input event is detected and when the corresponding frame update completes.
+
+## Features
+
+- **Last Frame Time**: Shows the duration (in milliseconds) of the most recent user-triggered frame
+- **Average Frame Time**: Displays the average duration across all recorded frames
+- **Max Frame Time**: Tracks the longest frame duration since the timer was enabled
+- **Idle Frame Exclusion**: Only measures frames triggered by user input; idle redraws (cursor blink, OS repaints) are not counted
+- **Toggle Control**: Show/hide the timer with **Ctrl+P**
+
+## How It Works
+
+### Frame Timing Mechanism
+
+1. **User Input Detection**: When the user performs an action (keypress, mouse click, scroll), the editor triggers the `start_frame()` method and sets a flag indicating user input
+2. **Frame Measurement**: The elapsed time between frame start and end is measured using Python's `time.time()`
+3. **Recording**: The frame time is recorded (in milliseconds) and used to calculate statistics
+4. **Idle Frames Ignored**: If a frame renders without user input, it is not counted
+
+### Supported Input Events
+
+- **Keyboard**: Any key press (including text input, navigation, special keys)
+- **Mouse**: Click, drag, and selection operations
+- **Scroll**: Wheel scroll events
+
+### Statistics Tracking
+
+- **Last Frame Time**: The duration of the most recent measured frame
+- **Average Frame Time**: Sum of all frame times divided by the number of frames
+- **Max Frame Time**: The longest recorded frame duration since enabling the timer
+
+## Usage
+
+### Toggle Frame Timer (Ctrl+P)
+
+Press **Ctrl+P** to toggle the frame timer visibility:
+- **Hidden State**: Timer widget is not displayed, and no frame timings are recorded
+- **Visible State**: Timer widget is displayed at the bottom of the editor window, and frame timings are actively recorded
+
+### Reading the Display
+
+```
+Last: 2.35 ms    Avg: 1.89 ms    Max: 5.43 ms
+```
+
+- **Last**: Duration of the most recent user-triggered frame
+- **Avg**: Average duration across all recorded frames since the timer was enabled
+- **Max**: Maximum duration of any frame since the timer was enabled
+
+### When to Use
+
+Use the Frame Timer to:
+- Identify slow frame processing during specific interactions
+- Monitor performance of text editing operations (typing, pasting, scrolling)
+- Detect performance regressions after code changes
+- Verify that idle operations (cursor blink) are not being counted
+
+## Expected Performance
+
+### Typical Values
+
+On a modern system with an empty file and no user interaction:
+- **Idle Frames (not measured)**: ~500ms between redraws (cursor blink)
+- **User Input Frames**: 2-5ms for text input
+- **Complex Operations**: May range 5-20ms (e.g., large paste, complex selection)
+
+### Verification
+
+To verify that idle frames are being excluded:
+1. Enable the frame timer (Ctrl+P)
+2. Open an empty file
+3. Leave the file untouched with the timer visible
+4. The displayed timings should remain near zero or show very small values (< 5ms)
+5. When you press a key or click, you'll see the frame time update with the user-triggered event
+
+If you see persistent ~500ms values without user interaction, the idle frame exclusion is not working correctly.
+
+## Implementation Details
+
+### FrameTimer Class
+
+Located in `textEditor.py`, the `FrameTimer` class manages all timing logic:
+
+```python
+class FrameTimer:
+    def start_frame() -> None       # Mark frame start (if user input triggered)
+    def end_frame() -> None         # Record frame end time
+    def set_user_input_triggered()  # Flag that user input triggered this frame
+    def get_average_frame_time()    # Calculate average of recorded frames
+    def reset()                     # Clear all timing data
+    def set_enabled(enabled: bool)  # Enable/disable recording
+```
+
+### FrameTimerWidget Class
+
+Provides the UI display component:
+- Updates every 100ms
+- Shows last, average, and max frame times
+- Respects dark/light mode theming
+- Automatically stops updating timer when hidden
+
+### Integration Points
+
+The frame timer is integrated into:
+- **TextEditor.keyPressEvent()**: Records key-triggered frames
+- **TextEditor.mousePressEvent()**: Records mouse click frames
+- **TextEditor.wheelEvent()**: Records scroll frames
+- **MainWindow.keyPressEvent()**: Handles Ctrl+P toggle
+
+## Troubleshooting
+
+### Timer Shows No Data
+
+**Problem**: Frame timer is visible but shows all zeros
+- **Solution**: Perform a user action (type a character, click, scroll) to trigger frame measurement
+
+### Timing Values Are Too High
+
+**Problem**: Seeing consistent 50ms+ values on simple operations
+- **Solution**: Check if system is under high load, or if heavy operations are being performed
+
+### Idle Frames Are Being Counted
+
+**Problem**: Seeing persistent 400-500ms values without user interaction
+- **Solution**: This indicates cursor blink or OS-triggered redraws are being measured. Verify that `set_user_input_triggered()` is only called in response to actual user input events, not internal Qt signals.
