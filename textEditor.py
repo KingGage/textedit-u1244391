@@ -2,6 +2,10 @@ import sys
 import json
 import re
 import time
+import mmap
+import os
+import bisect
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any
 from enum import Enum
@@ -11,7 +15,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QDialog, QLabel, QLineEdit, QCheckBox, QPushButton,
     QMenuBar, QStatusBar, QFileDialog, QMessageBox, QPlainTextEdit, QMenu,
     QTreeView, QDockWidget, QInputDialog, QHeaderView, QAbstractItemView,
-    QTabWidget, QSplitter, QTabBar
+    QTabWidget, QSplitter, QTabBar, QAbstractScrollArea, QScrollBar
 )
 from PyQt6.QtCore import QDir, QFileSystemWatcher, QModelIndex
 from PyQt6.QtGui import QFileSystemModel
@@ -75,6 +79,8 @@ class SettingsManager:
 class FrameTimer:
     """Tracks frame timing metrics (last, average, max frame times)."""
     
+    FRAME_BUDGET_MS = 16.0  # 60 fps target
+
     def __init__(self):
         self.enabled = False
         self.frame_start_time = None
@@ -84,6 +90,7 @@ class FrameTimer:
         self.last_frame_time = 0.0  # ms
         self.frame_times = []  # list of frame times in ms
         self.max_frame_time = 0.0  # ms
+        self.dropped_frames = 0  # frames exceeding 16ms budget
     
     def start_frame(self) -> None:
         """Mark the start of a frame (only if user input was triggered)."""
@@ -104,6 +111,9 @@ class FrameTimer:
         if elapsed > self.max_frame_time:
             self.max_frame_time = elapsed
         
+        if elapsed > self.FRAME_BUDGET_MS:
+            self.dropped_frames += 1
+        
         self.user_input_triggered = False
         self.frame_start_time = None
     
@@ -123,6 +133,7 @@ class FrameTimer:
         self.frame_times = []
         self.last_frame_time = 0.0
         self.max_frame_time = 0.0
+        self.dropped_frames = 0
         self.user_input_triggered = False
         self.frame_start_time = None
     
@@ -185,6 +196,315 @@ class FileManager:
     def get_file_name(self) -> str:
         """Get current file name or 'Untitled'."""
         return self.current_file.name if self.current_file else "Untitled"
+
+
+# ============================================================================
+# Memory-Mapped File Document
+# ============================================================================
+
+class MmapDocument:
+    """Memory-mapped file document with line index and lazy replacements.
+    
+    Libraries used:
+    - mmap (Python stdlib) — memory-maps the file descriptor so the OS pages
+      file content in on demand rather than loading it all at startup. Required
+      to open large.txt without a multi-second delay.
+    - threading (Python stdlib) — runs the line-index build on a background
+      thread so the editor stays responsive while indexing large files.
+    - bisect (Python stdlib) — binary search on the sorted line-offset array
+      to convert byte offsets to line numbers in O(log n).
+    - os (Python stdlib) — fstat to get file size without reading the file.
+    """
+
+    def __init__(self, file_path, encoding=None):
+        self.file_path = Path(file_path)
+        self.encoding = encoding
+        self._fd = None
+        self._mm = None
+        self._lock = threading.Lock()
+        self._line_offsets = [0]
+        self._total_lines = 1
+        self._indexing_complete = False
+        self._cancel_indexing = False
+        self._file_size = 0
+        self.replacements = []  # list of (byte_offset, old_byte_len, new_bytes)
+        self._rep_offsets = []  # sorted list of offsets for bisect lookups
+
+    def open(self):
+        """Memory-map the file and start background line indexing."""
+        self._fd = open(self.file_path, 'rb')
+        self._file_size = os.fstat(self._fd.fileno()).st_size
+
+        if self._file_size == 0:
+            self._mm = None
+            self._line_offsets = [0]
+            self._total_lines = 1
+            self._indexing_complete = True
+            if not self.encoding:
+                self.encoding = 'utf-8'
+            return
+
+        self._mm = mmap.mmap(self._fd.fileno(), 0, access=mmap.ACCESS_READ)
+
+        if not self.encoding:
+            self.encoding = self._detect_encoding()
+
+        self._index_thread = threading.Thread(
+            target=self._build_line_index, daemon=True
+        )
+        self._index_thread.start()
+
+    def _detect_encoding(self):
+        """Detect file encoding from content sample."""
+        if self._mm is None:
+            return 'utf-8'
+        sample = self._mm[:min(4096, len(self._mm))]
+        if sample[:3] == b'\xef\xbb\xbf':
+            return 'utf-8-sig'
+        if sample[:2] in (b'\xff\xfe', b'\xfe\xff'):
+            return 'utf-16'
+        try:
+            sample.decode('utf-8')
+            return 'utf-8'
+        except UnicodeDecodeError:
+            return 'latin-1'
+
+    def _build_line_index(self):
+        """Scan mmap once to build line offset index (background thread)."""
+        offsets = []
+        pos = 0
+        mm_len = len(self._mm)
+
+        while pos < mm_len:
+            if self._cancel_indexing:
+                return
+            nl = self._mm.find(b'\n', pos)
+            if nl == -1:
+                break
+            offsets.append(nl + 1)
+            pos = nl + 1
+
+            if len(offsets) >= 50000:
+                with self._lock:
+                    self._line_offsets.extend(offsets)
+                    self._total_lines = len(self._line_offsets)
+                offsets = []
+
+        if offsets:
+            with self._lock:
+                self._line_offsets.extend(offsets)
+                self._total_lines = len(self._line_offsets)
+
+        with self._lock:
+            self._indexing_complete = True
+
+    def get_total_lines(self):
+        with self._lock:
+            return self._total_lines
+
+    def is_indexing_complete(self):
+        with self._lock:
+            return self._indexing_complete
+
+    def get_line(self, line_num):
+        """Get decoded text for a line, with replacements applied."""
+        with self._lock:
+            if line_num < 0 or line_num >= self._total_lines:
+                return ""
+            start = self._line_offsets[line_num]
+            if line_num + 1 < self._total_lines:
+                end = self._line_offsets[line_num + 1]
+            else:
+                end = self._file_size
+
+        if self._mm is None:
+            return ""
+
+        raw = self._mm[start:end]
+
+        if raw.endswith(b'\r\n'):
+            raw = raw[:-2]
+        elif raw.endswith(b'\n'):
+            raw = raw[:-1]
+
+        raw = self._apply_byte_replacements(raw, start)
+        return raw.decode(self.encoding, errors='replace')
+
+    def get_line_byte_range(self, line_num):
+        """Get (start, end) byte range for a line."""
+        with self._lock:
+            if line_num < 0 or line_num >= self._total_lines:
+                return (0, 0)
+            start = self._line_offsets[line_num]
+            if line_num + 1 < self._total_lines:
+                end = self._line_offsets[line_num + 1]
+            else:
+                end = self._file_size
+        return (start, end)
+
+    def _apply_byte_replacements(self, raw_bytes, line_byte_start):
+        """Apply pending replacements at byte level to a line's raw bytes.
+        
+        Uses bisect on the sorted offset index to find only the replacements
+        that overlap this line's byte range — O(log n + k) instead of O(n).
+        """
+        if not self.replacements:
+            return raw_bytes
+
+        line_byte_end = line_byte_start + len(raw_bytes)
+
+        # Binary search for the first replacement that could overlap this line
+        lo = bisect.bisect_left(self._rep_offsets, line_byte_start)
+        # Back up: a replacement starting before this line could still overlap
+        # if its span extends into the line
+        scan_start = max(0, lo - 1)
+
+        applicable = []
+        for i in range(scan_start, len(self.replacements)):
+            offset, old_len, new_bytes = self.replacements[i]
+            if offset >= line_byte_end:
+                break  # past this line, done
+            if offset + old_len > line_byte_start:
+                applicable.append((offset, old_len, new_bytes))
+
+        if not applicable:
+            return raw_bytes
+
+        # Apply in reverse offset order to keep positions stable
+        applicable.sort(key=lambda r: r[0], reverse=True)
+        result = bytearray(raw_bytes)
+        for offset, old_len, new_bytes in applicable:
+            local_start = max(0, offset - line_byte_start)
+            local_end = min(len(result), offset + old_len - line_byte_start)
+            result[local_start:local_end] = new_bytes
+
+        return bytes(result)
+
+    def byte_offset_to_line(self, offset):
+        """Convert byte offset to line number using binary search."""
+        with self._lock:
+            line = bisect.bisect_right(self._line_offsets, offset) - 1
+            return max(0, line)
+
+    def search(self, pattern, case_sensitive=False, whole_word=False, use_regex=False):
+        """Search over mmap bytes, return list of (start, end) byte offsets.
+        
+        Matches that fall inside an already-replaced region are filtered out
+        so that a second find after replace returns correct counts.
+        """
+        if self._mm is None:
+            return []
+
+        try:
+            flags = 0 if case_sensitive else re.IGNORECASE
+
+            if use_regex:
+                regex_bytes = pattern.encode(self.encoding)
+            else:
+                pattern_bytes = pattern.encode(self.encoding)
+                regex_bytes = re.escape(pattern_bytes)
+                if whole_word:
+                    regex_bytes = b'\\b' + regex_bytes + b'\\b'
+
+            compiled = re.compile(regex_bytes, flags)
+            results = []
+            for match in compiled.finditer(self._mm):
+                results.append(match.span())
+
+            # Filter out matches inside already-replaced regions
+            if results and self.replacements:
+                results = self._filter_replaced(results)
+
+            return results
+        except (re.error, UnicodeEncodeError):
+            return []
+
+    def _filter_replaced(self, matches):
+        """Remove matches that overlap with existing replacement records.
+        
+        Uses bisect on the sorted _rep_offsets for O(log n) per match.
+        """
+        filtered = []
+        for m_start, m_end in matches:
+            # Find the replacement whose offset is <= m_start
+            idx = bisect.bisect_right(self._rep_offsets, m_start) - 1
+            if idx >= 0:
+                rep_offset, rep_old_len, _ = self.replacements[idx]
+                if m_start < rep_offset + rep_old_len:
+                    continue  # match is inside this replaced region
+            filtered.append((m_start, m_end))
+        return filtered
+
+    def add_replacements_from_matches(self, matches, replacement_text):
+        """Add replacement records sorted by offset with a bisect index."""
+        new_bytes = replacement_text.encode(self.encoding)
+        # Build sorted by offset ascending so bisect works in _apply_byte_replacements
+        for start, end in sorted(matches):
+            self.replacements.append((start, end - start, new_bytes))
+        # Rebuild offset index for bisect lookups
+        self._rep_offsets = [r[0] for r in self.replacements]
+
+    def clear_replacements(self):
+        self.replacements = []
+        self._rep_offsets = []
+
+    def flush_replacements(self):
+        """Apply pending replacements to disk and re-mmap so the next search
+        sees up-to-date content.  Blocks until re-indexing completes."""
+        if not self.replacements:
+            return
+        self.save_to_file()
+        # Wait for the background line-index rebuild to finish so that
+        # byte_offset_to_line works immediately after flush.
+        if hasattr(self, '_index_thread') and self._index_thread.is_alive():
+            self._index_thread.join()
+
+    def save_to_file(self, target_path=None):
+        """Apply all replacements and write to disk."""
+        path = Path(target_path) if target_path else self.file_path
+
+        if not self.replacements:
+            return True
+
+        if self._mm is None:
+            return True
+
+        content = bytearray(self._mm[:])
+        sorted_reps = sorted(self.replacements, key=lambda r: r[0], reverse=True)
+        for offset, old_len, new_bytes in sorted_reps:
+            content[offset:offset + old_len] = new_bytes
+
+        self._mm.close()
+        self._fd.close()
+
+        with open(path, 'wb') as f:
+            f.write(content)
+
+        self.replacements = []
+        self._rep_offsets = []
+        self._line_offsets = [0]
+        self._total_lines = 1
+        self._indexing_complete = False
+        self._fd = None
+        self._mm = None
+        self.open()
+        return True
+
+    def close(self):
+        """Clean up mmap and file descriptor."""
+        self._cancel_indexing = True
+        if self._mm:
+            try:
+                self._mm.close()
+            except Exception:
+                pass
+            self._mm = None
+        if self._fd:
+            try:
+                self._fd.close()
+            except Exception:
+                pass
+            self._fd = None
 
 
 # ============================================================================
@@ -1431,17 +1751,466 @@ class TextEditor(QPlainTextEdit):
 
 
 # ============================================================================
+# Memory-Mapped Text View (Virtual/Windowed Rendering)
+# ============================================================================
+
+class MmapCursor:
+    """Minimal cursor-like object for MmapTextView status bar compatibility."""
+
+    def __init__(self, line=0, col=0):
+        self._line = line
+        self._col = col
+
+    def blockNumber(self):
+        return self._line
+
+    def positionInBlock(self):
+        return self._col
+
+
+class MmapLineNumberArea(QWidget):
+    """Line number area for MmapTextView."""
+
+    def __init__(self, text_view):
+        super().__init__(text_view)
+        self._text_view = text_view
+
+    def sizeHint(self):
+        return QSize(self._text_view.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self._text_view._paint_line_numbers(event)
+
+
+class MmapTextView(QAbstractScrollArea):
+    """Virtual text view backed by a memory-mapped file.
+
+    Only renders the lines currently visible in the viewport. Content is
+    fetched on-demand from the MmapDocument, which reads from the OS-managed
+    mmap region. This keeps open time near-instant for any file size.
+    """
+
+    cursorPositionChanged = pyqtSignal()
+    textChanged = pyqtSignal()
+
+    def __init__(self, tab_width=4, auto_indent=True, parent=None):
+        super().__init__(parent)
+        self.mmap_doc: Optional[MmapDocument] = None
+        self.dark_mode = False
+        self.tab_width = tab_width
+        self.auto_indent = auto_indent
+        self.frame_timer: Optional[FrameTimer] = None
+
+        font = QFont("Courier New", 12)
+        font.setFixedPitch(True)
+        self.setFont(font)
+
+        self._cursor_line = 0
+        self._cursor_col = 0
+
+        # Search highlights sorted by line_num for bisect lookup
+        self._search_highlights: list[tuple[int, int, int]] = []
+        self._hl_lines: list[int] = []  # parallel list of line numbers
+
+        # Line number area
+        self.line_number_area = MmapLineNumberArea(self)
+
+        # Scrollbar signals for frame timing
+        self.verticalScrollBar().actionTriggered.connect(self._on_scrollbar_action)
+        self.horizontalScrollBar().actionTriggered.connect(self._on_scrollbar_action)
+
+        # Timer to check background indexing progress
+        self._index_timer = QTimer()
+        self._index_timer.timeout.connect(self._check_index_progress)
+
+        self._update_line_number_width()
+        self.apply_theme()
+
+    def set_document(self, mmap_doc: MmapDocument):
+        """Set the mmap document to display."""
+        self.mmap_doc = mmap_doc
+        self._update_scrollbar()
+        self._update_line_number_width()
+        self.viewport().update()
+        self.line_number_area.update()
+        if not mmap_doc.is_indexing_complete():
+            self._index_timer.start(100)
+
+    def _check_index_progress(self):
+        """Periodically update scrollbar/view as background indexing progresses."""
+        if self.mmap_doc and self.mmap_doc.is_indexing_complete():
+            self._index_timer.stop()
+        self._update_scrollbar()
+        self._update_line_number_width()
+        self.viewport().update()
+        self.line_number_area.update()
+
+    def _update_scrollbar(self):
+        if not self.mmap_doc:
+            return
+        total = self.mmap_doc.get_total_lines()
+        visible = self._visible_line_count()
+        self.verticalScrollBar().setRange(0, max(0, total - visible))
+        self.verticalScrollBar().setPageStep(visible)
+        self.verticalScrollBar().setSingleStep(1)
+
+    def _visible_line_count(self):
+        line_height = self.fontMetrics().height()
+        return max(1, self.viewport().height() // line_height)
+
+    def _first_visible_line(self):
+        return self.verticalScrollBar().value()
+
+    # --- Viewport painting via viewportEvent ---
+
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Type.Paint:
+            self._paint_viewport()
+            return True
+        return super().viewportEvent(event)
+
+    def _paint_viewport(self):
+        painter = QPainter(self.viewport())
+
+        if self.dark_mode:
+            painter.fillRect(self.viewport().rect(), QColor("#1e1e1e"))
+            text_color = QColor("#d4d4d4")
+            current_line_bg = QColor("#3d3d3d")
+        else:
+            painter.fillRect(self.viewport().rect(), QColor("#ffffff"))
+            text_color = QColor("#000000")
+            current_line_bg = QColor("#e6f3ff")
+
+        if not self.mmap_doc:
+            painter.end()
+            return
+
+        fm = self.fontMetrics()
+        line_height = fm.height()
+        char_width = fm.horizontalAdvance('M')
+        first_line = self._first_visible_line()
+        visible_count = self._visible_line_count()
+        h_offset = self.horizontalScrollBar().value()
+
+        highlight_color = QColor("#806000") if self.dark_mode else QColor("#ffff00")
+
+        # Pre-compute the range of highlights visible in this frame via bisect
+        has_highlights = bool(self._hl_lines)
+        if has_highlights:
+            hl_lo = bisect.bisect_left(self._hl_lines, first_line)
+            hl_hi = bisect.bisect_right(self._hl_lines, first_line + visible_count)
+
+        y = 0
+        for i in range(visible_count + 1):
+            line_num = first_line + i
+            if line_num >= self.mmap_doc.get_total_lines():
+                break
+
+            if line_num == self._cursor_line:
+                painter.fillRect(0, y, self.viewport().width(), line_height, current_line_bg)
+
+            text = self.mmap_doc.get_line(line_num)
+            text = text.expandtabs(self.tab_width)
+
+            # Draw search highlights — only iterate the visible slice
+            if has_highlights:
+                for j in range(hl_lo, hl_hi):
+                    hl_line, hl_start, hl_end = self._search_highlights[j]
+                    if hl_line == line_num:
+                        x_start = hl_start * char_width - h_offset
+                        x_end = hl_end * char_width - h_offset
+                        painter.fillRect(int(x_start), y, int(x_end - x_start), line_height, highlight_color)
+
+            painter.setPen(text_color)
+            painter.drawText(-h_offset, y, self.viewport().width() + h_offset,
+                             line_height, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             text)
+            y += line_height
+
+        painter.end()
+
+    def _paint_line_numbers(self, event):
+        painter = QPainter(self.line_number_area)
+
+        if self.dark_mode:
+            painter.fillRect(event.rect(), QColor("#2d2d2d"))
+            number_color = QColor("#888888")
+            current_color = QColor("#ffffff")
+        else:
+            painter.fillRect(event.rect(), QColor("#f0f0f0"))
+            number_color = QColor("#888888")
+            current_color = QColor("#000000")
+
+        fm = self.fontMetrics()
+        line_height = fm.height()
+        first_line = self._first_visible_line()
+        visible_count = self._visible_line_count()
+
+        y = 0
+        for i in range(visible_count + 1):
+            line_num = first_line + i
+            if self.mmap_doc and line_num >= self.mmap_doc.get_total_lines():
+                break
+
+            number = str(line_num + 1)
+            if line_num == self._cursor_line:
+                painter.setPen(current_color)
+                f = painter.font()
+                f.setBold(True)
+                painter.setFont(f)
+            else:
+                painter.setPen(number_color)
+                f = painter.font()
+                f.setBold(False)
+                painter.setFont(f)
+
+            painter.drawText(0, y, self.line_number_area.width() - 5,
+                             line_height, Qt.AlignmentFlag.AlignRight, number)
+            y += line_height
+
+        painter.end()
+
+    def line_number_area_width(self):
+        if not self.mmap_doc:
+            return 40
+        total = self.mmap_doc.get_total_lines()
+        digits = max(1, len(str(total)))
+        return 10 + self.fontMetrics().horizontalAdvance('9') * digits
+
+    def _update_line_number_width(self):
+        width = self.line_number_area_width()
+        self.setViewportMargins(width, 0, 0, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        width = self.line_number_area_width()
+        self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), width, cr.height()))
+        self._update_line_number_width()
+        self._update_scrollbar()
+
+    def scrollContentsBy(self, dx, dy):
+        self.viewport().update()
+        self.line_number_area.update()
+
+    # --- Event handlers with frame timing ---
+
+    def wheelEvent(self, event):
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+
+        delta = event.angleDelta().y()
+        lines = -(delta // 40)
+        new_value = self.verticalScrollBar().value() + lines
+        self.verticalScrollBar().setValue(new_value)
+        self.viewport().update()
+        self.line_number_area.update()
+
+        if self.frame_timer:
+            self.frame_timer.end_frame()
+
+    def _on_scrollbar_action(self, action):
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+            QTimer.singleShot(0, self._end_scrollbar_frame)
+        self.viewport().update()
+        self.line_number_area.update()
+
+    def _end_scrollbar_frame(self):
+        if self.frame_timer:
+            self.frame_timer.end_frame()
+
+    def mousePressEvent(self, event):
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            fm = self.fontMetrics()
+            line_height = fm.height()
+            char_width = fm.horizontalAdvance('M')
+            y_pos = event.pos().y()
+            x_pos = event.pos().x() + self.horizontalScrollBar().value()
+            line = self._first_visible_line() + y_pos // line_height
+            col = max(0, int(x_pos / char_width))
+            if self.mmap_doc:
+                line = min(line, self.mmap_doc.get_total_lines() - 1)
+            self._cursor_line = line
+            self._cursor_col = col
+            self.cursorPositionChanged.emit()
+            self.viewport().update()
+            self.line_number_area.update()
+
+        if self.frame_timer:
+            self.frame_timer.end_frame()
+
+    def keyPressEvent(self, event):
+        if self.frame_timer:
+            self.frame_timer.set_user_input_triggered()
+            self.frame_timer.start_frame()
+
+        handled = False
+        key = event.key()
+        if key == Qt.Key.Key_Down:
+            if self.mmap_doc and self._cursor_line < self.mmap_doc.get_total_lines() - 1:
+                self._cursor_line += 1
+                self._ensure_cursor_visible()
+                self.cursorPositionChanged.emit()
+            handled = True
+        elif key == Qt.Key.Key_Up:
+            if self._cursor_line > 0:
+                self._cursor_line -= 1
+                self._ensure_cursor_visible()
+                self.cursorPositionChanged.emit()
+            handled = True
+        elif key == Qt.Key.Key_PageDown:
+            if self.mmap_doc:
+                self._cursor_line = min(
+                    self._cursor_line + self._visible_line_count(),
+                    self.mmap_doc.get_total_lines() - 1
+                )
+                self._ensure_cursor_visible()
+                self.cursorPositionChanged.emit()
+            handled = True
+        elif key == Qt.Key.Key_PageUp:
+            self._cursor_line = max(0, self._cursor_line - self._visible_line_count())
+            self._ensure_cursor_visible()
+            self.cursorPositionChanged.emit()
+            handled = True
+        elif key == Qt.Key.Key_Home:
+            self._cursor_line = 0
+            self._cursor_col = 0
+            self._ensure_cursor_visible()
+            self.cursorPositionChanged.emit()
+            handled = True
+        elif key == Qt.Key.Key_End:
+            if self.mmap_doc:
+                self._cursor_line = self.mmap_doc.get_total_lines() - 1
+                self._ensure_cursor_visible()
+                self.cursorPositionChanged.emit()
+            handled = True
+
+        if handled:
+            self.viewport().update()
+            self.line_number_area.update()
+        else:
+            # Pass unhandled keys (like Ctrl+P) up to parent (MainWindow)
+            super().keyPressEvent(event)
+
+        if self.frame_timer:
+            self.frame_timer.end_frame()
+
+    def _ensure_cursor_visible(self):
+        first = self._first_visible_line()
+        visible = self._visible_line_count()
+        if self._cursor_line < first:
+            self.verticalScrollBar().setValue(self._cursor_line)
+        elif self._cursor_line >= first + visible:
+            self.verticalScrollBar().setValue(self._cursor_line - visible + 1)
+
+    # --- Search highlight support ---
+
+    def set_search_highlights(self, byte_matches):
+        """Set search highlights from byte offset matches, sorted by line."""
+        self._search_highlights = []
+        self._hl_lines = []
+        if not self.mmap_doc or not byte_matches:
+            self.viewport().update()
+            return
+
+        # byte_matches are already sorted by offset → sorted by line
+        for start, end in byte_matches:
+            line_num = self.mmap_doc.byte_offset_to_line(start)
+            line_start, _ = self.mmap_doc.get_line_byte_range(line_num)
+
+            raw_before = self.mmap_doc._mm[line_start:start]
+            col_start = len(raw_before.decode(self.mmap_doc.encoding, errors='replace'))
+
+            raw_match = self.mmap_doc._mm[start:end]
+            match_len = len(raw_match.decode(self.mmap_doc.encoding, errors='replace'))
+            col_end = col_start + match_len
+
+            self._search_highlights.append((line_num, col_start, col_end))
+            self._hl_lines.append(line_num)
+
+        self.viewport().update()
+
+    def clear_search_highlights(self):
+        self._search_highlights = []
+        self._hl_lines = []
+        self.viewport().update()
+
+    # --- Compatibility methods for integration with existing editor code ---
+
+    def set_dark_mode(self, enabled):
+        self.dark_mode = enabled
+        self.apply_theme()
+        self.viewport().update()
+        self.line_number_area.update()
+
+    def apply_theme(self):
+        if self.dark_mode:
+            self.setStyleSheet("QAbstractScrollArea { background-color: #1e1e1e; color: #d4d4d4; }")
+        else:
+            self.setStyleSheet("QAbstractScrollArea { background-color: #ffffff; color: #000000; }")
+
+    def textCursor(self):
+        return MmapCursor(self._cursor_line, self._cursor_col)
+
+    def isReadOnly(self):
+        return True
+
+    def highlight_current_line(self):
+        self.clear_search_highlights()
+
+    def blockCount(self):
+        return self.mmap_doc.get_total_lines() if self.mmap_doc else 1
+
+    def setExtraSelections(self, selections):
+        pass
+
+    def toPlainText(self):
+        if not self.mmap_doc or self.mmap_doc._mm is None:
+            return ""
+        return self.mmap_doc._mm[:].decode(self.mmap_doc.encoding, errors='replace')
+
+    def setPlainText(self, text):
+        pass
+
+    def undo(self):
+        pass
+
+    def redo(self):
+        pass
+
+    def cut(self):
+        pass
+
+    def copy(self):
+        pass
+
+    def paste(self):
+        pass
+
+    def selectAll(self):
+        pass
+
+
+# ============================================================================
 # Multi-File Tab Support
 # ============================================================================
 
 class EditorTab:
     """Represents a single file tab with its editor and metadata."""
     
-    def __init__(self, editor: TextEditor, file_path: Optional[Path] = None):
+    def __init__(self, editor, file_path: Optional[Path] = None):
         self.editor = editor
         self.file_path = file_path
         self.is_modified = False
         self.encoding = "utf-8"
+        self.mmap_doc: Optional[MmapDocument] = None
     
     @property
     def name(self) -> str:
@@ -1554,8 +2323,11 @@ class EditorTabWidget(QTabWidget):
             tab.file_path = Path(file_path)
         
         try:
-            with open(tab.file_path, 'w', encoding=tab.encoding) as f:
-                f.write(tab.editor.toPlainText())
+            if tab.mmap_doc:
+                tab.mmap_doc.save_to_file(str(tab.file_path))
+            else:
+                with open(tab.file_path, 'w', encoding=tab.encoding) as f:
+                    f.write(tab.editor.toPlainText())
             tab.is_modified = False
             self._update_tab_title(tab)
             return True
@@ -1569,6 +2341,31 @@ class EditorTabWidget(QTabWidget):
         if 0 <= index < len(self.tabs):
             return self.tabs[index]
         return None
+    
+    def open_file_mmap(self, file_path: Path, mmap_doc: MmapDocument) -> EditorTab:
+        """Open a file using mmap in a new tab or switch to existing."""
+        for i, tab in enumerate(self.tabs):
+            if tab.file_path == file_path:
+                self.setCurrentIndex(i)
+                return tab
+        
+        view = MmapTextView(
+            tab_width=self.settings_manager.get("tab_width", 4),
+            auto_indent=self.settings_manager.get("auto_indent", True)
+        )
+        view.set_dark_mode(self.dark_mode)
+        view.set_document(mmap_doc)
+        
+        tab = EditorTab(view, file_path)
+        tab.mmap_doc = mmap_doc
+        tab.encoding = mmap_doc.encoding
+        tab.is_modified = False
+        self.tabs.append(tab)
+        
+        index = self.addTab(view, tab.name)
+        self.setCurrentIndex(index)
+        
+        return tab
     
     def open_file(self, file_path: Path, content: str, encoding: str = "utf-8") -> EditorTab:
         """Open a file in a new tab or switch to existing tab."""
@@ -1886,6 +2683,12 @@ class EditorPane(QWidget):
         tw = self.current_tab_widget()
         if tw:
             tw.open_file(file_path, content, encoding)
+    
+    def open_file_mmap(self, file_path: Path, mmap_doc: MmapDocument):
+        """Open a file using mmap in the current tab widget."""
+        tw = self.current_tab_widget()
+        if tw:
+            tw.open_file_mmap(file_path, mmap_doc)
     
     def save_current(self) -> bool:
         """Save the current file."""
@@ -2408,8 +3211,9 @@ class FrameTimerWidget(QWidget):
         self.last_label = QLabel("Last: 0.00 ms")
         self.avg_label = QLabel("Avg: 0.00 ms")
         self.max_label = QLabel("Max: 0.00 ms")
+        self.dropped_label = QLabel("Dropped: 0")
         
-        for label in [self.last_label, self.avg_label, self.max_label]:
+        for label in [self.last_label, self.avg_label, self.max_label, self.dropped_label]:
             label.setMinimumWidth(100)
             layout.addWidget(label)
         
@@ -2429,6 +3233,7 @@ class FrameTimerWidget(QWidget):
         avg = self.frame_timer.get_average_frame_time()
         self.avg_label.setText(f"Avg: {avg:.2f} ms")
         self.max_label.setText(f"Max: {self.frame_timer.max_frame_time:.2f} ms")
+        self.dropped_label.setText(f"Dropped: {self.frame_timer.dropped_frames}")
     
     def apply_theme(self, dark_mode: bool):
         """Apply dark or light theme."""
@@ -2565,7 +3370,6 @@ class FindReplaceDialog(QDialog):
         find_layout = QHBoxLayout()
         find_layout.addWidget(QLabel("Find:"))
         self.find_input = QLineEdit()
-        self.find_input.textChanged.connect(self.find_all)  # Live search as you type
         find_layout.addWidget(self.find_input)
         layout.addLayout(find_layout)
         
@@ -2585,11 +3389,6 @@ class FindReplaceDialog(QDialog):
         self.case_sensitive = QCheckBox("Case Sensitive")
         self.whole_word = QCheckBox("Whole Word")
         self.regex = QCheckBox("Regular Expression")
-        
-        # Re-run search when options change
-        self.case_sensitive.stateChanged.connect(self.find_all)
-        self.whole_word.stateChanged.connect(self.find_all)
-        self.regex.stateChanged.connect(self.find_all)
         
         layout.addWidget(self.case_sensitive)
         layout.addWidget(self.whole_word)
@@ -2648,6 +3447,20 @@ class FindReplaceDialog(QDialog):
         else:
             self.setStyleSheet("")
     
+    def _flush_pending_replacements(self):
+        """Flush any pending mmap replacements to disk so the next search
+        sees up-to-date file content."""
+        for tab, editor in self.get_all_editors():
+            if tab.mmap_doc and tab.mmap_doc.replacements:
+                tab.mmap_doc.flush_replacements()
+                tab.is_modified = False
+                # Update scrollbar / line numbers after re-index
+                if isinstance(editor, MmapTextView):
+                    editor._update_scrollbar()
+                    editor._update_line_number_width()
+                    editor.viewport().update()
+                    editor.line_number_area.update()
+
     def find_all(self):
         """Find all occurrences across all open files and highlight them."""
         frame_timer = self.main_window.frame_timer
@@ -2661,6 +3474,9 @@ class FindReplaceDialog(QDialog):
             frame_timer.end_frame()
             return
         
+        # Flush pending replacements so search sees current content
+        self._flush_pending_replacements()
+        
         case_sensitive = self.case_sensitive.isChecked()
         whole_word = self.whole_word.isChecked()
         use_regex = self.regex.isChecked()
@@ -2669,6 +3485,7 @@ class FindReplaceDialog(QDialog):
         files_with_matches = 0
         
         try:
+            # Compile regex for TextEditor-based tabs
             flags = 0 if case_sensitive else re.IGNORECASE
             
             if use_regex:
@@ -2680,17 +3497,26 @@ class FindReplaceDialog(QDialog):
                 regex = re.compile(escaped, flags)
             
             for tab, editor in self.get_all_editors():
-                text = editor.toPlainText()
-                results = []
-                
-                for match in regex.finditer(text):
-                    results.append(match.span())
-                
-                if results:
-                    files_with_matches += 1
-                    total_matches += len(results)
-                
-                self._highlight_matches_in_editor(editor, results)
+                if tab.mmap_doc:
+                    # Mmap-based search over raw bytes
+                    matches = tab.mmap_doc.search(
+                        pattern, case_sensitive, whole_word, use_regex
+                    )
+                    if matches:
+                        files_with_matches += 1
+                        total_matches += len(matches)
+                    if isinstance(editor, MmapTextView):
+                        editor.set_search_highlights(matches)
+                else:
+                    # TextEditor-based search
+                    text = editor.toPlainText()
+                    results = []
+                    for match in regex.finditer(text):
+                        results.append(match.span())
+                    if results:
+                        files_with_matches += 1
+                        total_matches += len(results)
+                    self._highlight_matches_in_editor(editor, results)
                 
         except re.error:
             pass
@@ -2722,6 +3548,9 @@ class FindReplaceDialog(QDialog):
                 frame_timer.end_frame()
                 return
         
+        # Flush pending replacements so search sees current content
+        self._flush_pending_replacements()
+        
         case_sensitive = self.case_sensitive.isChecked()
         whole_word = self.whole_word.isChecked()
         use_regex = self.regex.isChecked()
@@ -2730,6 +3559,7 @@ class FindReplaceDialog(QDialog):
         files_modified = 0
         
         try:
+            # Compile regex for TextEditor-based tabs
             flags = 0 if case_sensitive else re.IGNORECASE
             
             if use_regex:
@@ -2741,13 +3571,29 @@ class FindReplaceDialog(QDialog):
                 regex = re.compile(escaped, flags)
             
             for tab, editor in self.get_all_editors():
-                text = editor.toPlainText()
-                new_text, count = regex.subn(replacement, text)
-                if count > 0:
-                    editor.setPlainText(new_text)
-                    tab.is_modified = True
-                    total_count += count
-                    files_modified += 1
+                if tab.mmap_doc:
+                    # Mmap-based lazy replace: build replacement records
+                    matches = tab.mmap_doc.search(
+                        pattern, case_sensitive, whole_word, use_regex
+                    )
+                    if matches:
+                        tab.mmap_doc.add_replacements_from_matches(
+                            matches, replacement
+                        )
+                        tab.is_modified = True
+                        total_count += len(matches)
+                        files_modified += 1
+                        if isinstance(editor, MmapTextView):
+                            editor.viewport().update()
+                else:
+                    # TextEditor-based replace
+                    text = editor.toPlainText()
+                    new_text, count = regex.subn(replacement, text)
+                    if count > 0:
+                        editor.setPlainText(new_text)
+                        tab.is_modified = True
+                        total_count += count
+                        files_modified += 1
                     
         except re.error:
             pass
@@ -3057,16 +3903,18 @@ class MainWindow(QMainWindow):
         self._open_file_path(file_path)
     
     def _open_file_path(self, file_path: str):
-        """Open a file by path in a new tab."""
+        """Open a file by path using memory-mapped I/O."""
         self.frame_timer.set_user_input_triggered()
         self.frame_timer.start_frame()
         
-        content, success = self.file_manager.read_file(Path(file_path))
-        
-        if success:
-            self.editor_pane.open_file(Path(file_path), content, self.file_manager.encoding)
+        try:
+            path = Path(file_path)
+            mmap_doc = MmapDocument(path)
+            mmap_doc.open()
+            
+            self.editor_pane.open_file_mmap(path, mmap_doc)
             self._update_title()
-            self.encoding_label.setText(self.file_manager.encoding.upper())
+            self.encoding_label.setText(mmap_doc.encoding.upper())
             
             # Add to recent files
             recent = self.settings_manager.get("recent_files", [])
@@ -3075,8 +3923,8 @@ class MainWindow(QMainWindow):
             recent.insert(0, file_path)
             self.settings_manager.set("recent_files", recent[:10])
             self.file_explorer.highlight_file(file_path)
-        else:
-            QMessageBox.critical(self, "Error", content)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
         
         self.frame_timer.end_frame()
     

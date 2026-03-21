@@ -24,7 +24,8 @@ from textEditor import (
     LineNumberArea, TextEditor, EditorTab, EditorTabWidget,
     SplitPaneWidget, EditorPane, MenuManager, MenuTabBar,
     FileTreeExplorer, StatusBarManager, FindReplaceDialog,
-    SearchEngine, MainWindow, main
+    SearchEngine, MainWindow, main,
+    MmapDocument, MmapTextView, MmapCursor, MmapLineNumberArea
 )
 
 # Create QApplication once for all tests
